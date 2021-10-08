@@ -47,18 +47,7 @@ class OapFilePartition(override val index: Int, override val files: Array[Partit
       case (host, numBytes) => host
     }.toArray
 
-    if (SparkEnv.get.conf.get(OapConf.OAP_EXTERNAL_CACHE_METADB_ENABLED) == true) {
-      val cacheHosts = CachedPartitionedFilePreferredLocs.getPreferredLocsByCache(files)
-        .take(3)
-        .toArray
-      if (cacheHosts.length != 0) {
-        cacheHosts
-      } else {
-        hdfsPreLocs
-      }
-    } else {
-      hdfsPreLocs
-    }
+    hdfsPreLocs
   }
 }
 
