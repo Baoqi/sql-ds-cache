@@ -113,25 +113,14 @@
 
   <dependencies>
     <dependency>
-        <groupId>redis.clients</groupId>
-        <artifactId>jedis</artifactId>
-        <version>3.1.0</version>
+      <groupId>redis.clients</groupId>
+      <artifactId>jedis</artifactId>
+      <version>3.1.0</version>
     </dependency>
     <dependency>
         <groupId>org.apache.commons</groupId>
         <artifactId>commons-pool2</artifactId>
         <version>2.6.2</version>
-    </dependency>
-    <dependency>
-      <groupId>com.intel.oap</groupId>
-      <artifactId>pmem-common</artifactId>
-      <version>${project.version}</version>
-      <exclusions>
-        <exclusion>
-          <groupId>io.pmem</groupId>
-          <artifactId>libpmemkv-jni</artifactId>
-        </exclusion>
-      </exclusions>
     </dependency>
     <dependency>
       <groupId>org.eclipse.jetty</groupId>
@@ -449,7 +438,6 @@
             <includes>
               <include>redis.clients:*</include>
               <include>org.apache.commons:commons-pool2</include>
-              <include>com.intel:pmem-common</include>
               <include>org.spark-project.spark:unused</include>
               <include>com.google.guava:guava</include>
               <include>org.apache.parquet:*</include>

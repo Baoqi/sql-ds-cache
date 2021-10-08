@@ -22,7 +22,6 @@ import java.util.concurrent.atomic.AtomicLong
 
 import scala.util.Success
 
-import com.intel.oap.common.unsafe.PersistentMemoryPlatform
 import org.apache.arrow.plasma.PlasmaClient
 
 import org.apache.spark.SparkEnv
@@ -130,10 +129,7 @@ private[sql] object MemoryManager extends Logging {
   def apply(sparkEnv: SparkEnv, memoryManagerOpt: String): MemoryManager = {
     memoryManagerOpt match {
       case "offheap" => new OffHeapMemoryManager(sparkEnv)
-      case "pm" => new PersistentMemoryManager(sparkEnv)
-      case "hybrid" => new HybridMemoryManager(sparkEnv)
       case "tmp" => new TmpDramMemoryManager(sparkEnv)
-      case "kmem" => new DaxKmemMemoryManager(sparkEnv)
       case "plasma" =>
         if (plasmaServerDetect()) {
           new PlasmaMemoryManager(sparkEnv)
@@ -161,7 +157,6 @@ private[sql] object MemoryManager extends Logging {
     checkConfCompatibility(cacheStrategyOpt, memoryManagerOpt)
     cacheStrategyOpt match {
       case "guava" => apply(sparkEnv, memoryManagerOpt)
-      case "noevict" => new HybridMemoryManager(sparkEnv)
       case "vmem" => new TmpDramMemoryManager(sparkEnv)
       case "external" =>
         if (plasmaServerDetect()) {
@@ -309,159 +304,6 @@ private[filecache] class TmpDramMemoryManager(sparkEnv: SparkEnv)
   }
 }
 
-/**
- * A memory manager which supports allocate/free volatile memory from Intel Optane DC
- * persistent memory.
- */
-private[filecache] class PersistentMemoryManager(sparkEnv: SparkEnv)
-  extends MemoryManager with Logging {
-
-  private val _memorySize = init()
-
-  private val _memoryUsed = new AtomicLong(0)
-
-  private def init(): Long = {
-    val conf = sparkEnv.conf
-
-    // The NUMA id should be set when the executor process start up. However, Spark don't
-    // support NUMA binding currently.
-    var numaId = conf.getInt("spark.executor.numa.id", -1)
-    val executorIdStr = sparkEnv.executorId
-    scala.util.Try(executorIdStr.toInt) match {
-      case Success(_) => logDebug("valid executor id for numa binding.") ;
-      case _ =>
-        logWarning("invalid executor id for numa binding.")
-        return 0L
-    }
-    val executorId = executorIdStr.toInt
-    val map = PersistentMemoryConfigUtils.parseConfig(conf)
-    if (numaId == -1) {
-      logWarning(s"Executor ${executorId} is not bind with NUMA. It would be better to bind " +
-        s"executor with NUMA when cache data to Intel Optane DC persistent memory.")
-      // Just round the executorId to the total NUMA number.
-      // TODO: improve here
-      numaId = executorId % PersistentMemoryConfigUtils.totalNumaNode(conf)
-    }
-
-    val initialPath = map.get(numaId).get
-    val initialSizeStr =
-      if (conf.getOption(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_INITIAL_SIZE.key).isDefined) {
-        conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_INITIAL_SIZE).trim
-      } else {
-        conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_INITIAL_SIZE_BK).trim
-      }
-    val initialSize = Utils.byteStringAsBytes(initialSizeStr)
-    val reservedSizeStr =
-      if (conf.getOption(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_RESERVED_SIZE.key).isDefined) {
-      conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_RESERVED_SIZE).trim
-      } else {
-      conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_RESERVED_SIZE_BK).trim
-      }
-
-    val reservedSize = Utils.byteStringAsBytes(reservedSizeStr)
-
-    val enableConservative =
-      if (conf.getOption(OapConf.OAP_ENABLE_MEMKIND_CONSERVATIVE.key).isDefined) {
-        conf.getBoolean(OapConf.OAP_ENABLE_MEMKIND_CONSERVATIVE.key,
-          OapConf.OAP_ENABLE_MEMKIND_CONSERVATIVE.defaultValue.get)
-      } else {
-        conf.getBoolean(OapConf.OAP_ENABLE_MEMKIND_CONSERVATIVE_BK.key,
-          OapConf.OAP_ENABLE_MEMKIND_CONSERVATIVE_BK.defaultValue.get)
-      }
-    val memkindPattern = if (enableConservative) 1 else 0
-
-    logInfo(s"Current Memkind pattern: ${memkindPattern}")
-
-    val fullPath = Utils.createTempDir(initialPath + File.separator + executorId)
-    PersistentMemoryPlatform.initialize(fullPath.getCanonicalPath, initialSize, memkindPattern)
-    logInfo(s"Initialize Intel Optane DC persistent memory successfully, numaId: ${numaId}, " +
-      s"initial path: ${fullPath.getCanonicalPath}, initial size: ${initialSize}, reserved size: " +
-      s"${reservedSize}")
-    require(reservedSize >= 0 && reservedSize < initialSize, s"Reserved size(${reservedSize}) " +
-      s"should be larger than zero and smaller than initial size(${initialSize})")
-    initialSize - reservedSize
-  }
-
-  override def memoryUsed: Long = _memoryUsed.get()
-
-  override def memorySize: Long = _memorySize
-
-  override private[filecache] def allocate(size: Long): MemoryBlockHolder = {
-    try {
-      val address = PersistentMemoryPlatform.allocateVolatileMemory(size)
-      val occupiedSize = PersistentMemoryPlatform.getOccupiedSize(address)
-      _memoryUsed.getAndAdd(occupiedSize)
-      logDebug(s"request allocate $size memory, actual occupied size: " +
-        s"${occupiedSize}, used: $memoryUsed")
-      MemoryBlockHolder(null, address, size, occupiedSize, SourceEnum.PM)
-    } catch {
-      case e: OutOfMemoryError =>
-        logWarning(e.getMessage)
-        MemoryBlockHolder(null, 0L, 0L, 0L, SourceEnum.PM)
-    }
-  }
-
-  override private[filecache] def free(block: MemoryBlockHolder): Unit = {
-    assert(block.baseObject == null)
-    PersistentMemoryPlatform.freeMemory(block.baseOffset)
-    _memoryUsed.getAndAdd(-block.occupiedSize)
-    logDebug(s"freed ${block.occupiedSize} memory, used: $memoryUsed")
-  }
-
-  override def isDcpmmUsed(): Boolean = {true}
-}
-
-private[filecache] class DaxKmemMemoryManager(sparkEnv: SparkEnv)
-  extends PersistentMemoryManager(sparkEnv) with Logging {
-
-  private val _memorySize = init()
-
-  private def init(): Long = {
-    val conf = sparkEnv.conf
-
-    val numaId = conf.getInt("spark.executor.numa.id", -1)
-    if (numaId == -1) {
-      throw new OapException("DAX KMEM mode is strongly related to numa node. " +
-        "Please enable numa binding")
-    }
-
-    val map = PersistentMemoryConfigUtils.parseConfig(conf)
-    val regularNodeNum = map.size
-    val daxNodeId = numaId + regularNodeNum
-
-
-    val kmemCacheMemoryStr =
-      if (conf.getOption(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_INITIAL_SIZE.key).isDefined) {
-        conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_INITIAL_SIZE).trim
-        } else {
-        conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_INITIAL_SIZE_BK).trim
-        }
-    val kmemCacheMemoryReserverdStr =
-      if (conf.getOption(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_RESERVED_SIZE.key).isDefined) {
-        conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_RESERVED_SIZE).trim
-        } else {
-        conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_RESERVED_SIZE_BK).trim
-        }
-
-    val (kmemCacheMemory, kmemCacheMemoryReserverd) = {
-      (Utils.byteStringAsBytes(kmemCacheMemoryStr),
-        Utils.byteStringAsBytes(kmemCacheMemoryReserverdStr))
-    }
-
-    require(kmemCacheMemoryReserverd >= 0 && kmemCacheMemoryReserverd < kmemCacheMemory,
-      s"Reserved size(${kmemCacheMemoryReserverd}) should greater than zero and less than " +
-        s"initial size(${kmemCacheMemory})"
-    )
-    PersistentMemoryPlatform.setNUMANode(String.valueOf(daxNodeId), String.valueOf(numaId))
-    PersistentMemoryPlatform.initialize()
-    logInfo(s"Running DAX KMEM mode, will use ${kmemCacheMemory} as cache memory, " +
-      s"reserve $kmemCacheMemoryReserverd")
-    kmemCacheMemory - kmemCacheMemoryReserverd
-  }
-
-  override def memorySize: Long = _memorySize
-
-}
 
 private[filecache] class PlasmaMemoryManager(sparkEnv: SparkEnv)
   extends MemoryManager with Logging {
@@ -478,110 +320,3 @@ private[filecache] class PlasmaMemoryManager(sparkEnv: SparkEnv)
   override def memoryUsed: Long = 0
 }
 
-private[filecache] class HybridMemoryManager(sparkEnv: SparkEnv)
-  extends MemoryManager with Logging {
-  private val (persistentMemoryManager, dramMemoryManager) =
-    (new PersistentMemoryManager(sparkEnv), new TmpDramMemoryManager(sparkEnv))
-
-  private val _memoryUsed = new AtomicLong(0)
-
-  private var memBlockInPM = scala.collection.mutable.Set[MemoryBlockHolder]()
-
-  private val (_dataDRAMCacheSize, _dataPMCacheSize, _dramGuardianSize, _pmGuardianSize) = init()
-
-  var pmFull = false
-
-  private def init(): (Long, Long, Long, Long) = {
-    val conf = sparkEnv.conf
-    // The NUMA id should be set when the executor process start up. However, Spark don't
-    // support NUMA binding currently.
-    var numaId = conf.getInt("spark.executor.numa.id", -1)
-    val executorIdStr = sparkEnv.executorId
-    scala.util.Try(executorIdStr.toInt) match {
-      case Success(_) => logDebug("valid executor id for numa binding.") ;
-      case _ =>
-        logWarning("invalid executor id for numa binding.")
-        return(0L, 0L, 0L, 0L)
-    }
-    val executorId = executorIdStr.toInt
-    val map = PersistentMemoryConfigUtils.parseConfig(conf)
-    if (numaId == -1) {
-      logWarning(s"Executor ${executorId} is not bind with NUMA. It would be better to bind " +
-        s"executor with NUMA when cache data to Intel Optane DC persistent memory.")
-      // Just round the executorId to the total NUMA number.
-      // TODO: improve here
-      numaId = executorId % PersistentMemoryConfigUtils.totalNumaNode(conf)
-    }
-
-    val initialPath = map.get(numaId).get
-    val initialSizeStr =
-      if (conf.getOption(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_INITIAL_SIZE.key).isDefined) {
-        conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_INITIAL_SIZE).trim
-      } else {
-        conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_INITIAL_SIZE_BK).trim
-      }
-    val initialPMSize = Utils.byteStringAsBytes(initialSizeStr)
-    val reservedSizeStr =
-      if (conf.getOption(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_RESERVED_SIZE.key).isDefined) {
-        conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_RESERVED_SIZE).trim
-      } else {
-        conf.get(OapConf.OAP_FIBERCACHE_PERSISTENT_MEMORY_RESERVED_SIZE_BK).trim
-      }
-    val reservedPMSize = Utils.byteStringAsBytes(reservedSizeStr)
-    val fullPath = Utils.createTempDir(initialPath + File.separator + executorId)
-    val enableConservative =
-      if (conf.getOption(OapConf.OAP_ENABLE_MEMKIND_CONSERVATIVE.key).isDefined) {
-        conf.getBoolean(OapConf.OAP_ENABLE_MEMKIND_CONSERVATIVE.key,
-          OapConf.OAP_ENABLE_MEMKIND_CONSERVATIVE.defaultValue.get)
-       } else {
-        conf.getBoolean(OapConf.OAP_ENABLE_MEMKIND_CONSERVATIVE_BK.key,
-          OapConf.OAP_ENABLE_MEMKIND_CONSERVATIVE_BK.defaultValue.get)
-       }
-    val memkindPattern = if (enableConservative) 1 else 0
-    PersistentMemoryPlatform.initialize(fullPath.getCanonicalPath, initialPMSize, memkindPattern)
-    logInfo(s"Initialize Intel Optane DC persistent memory successfully, numaId: " +
-      s"${numaId}, initial path: ${fullPath.getCanonicalPath}, initial size: " +
-      s"${initialPMSize}, reserved size: ${reservedPMSize}")
-    require(reservedPMSize >= 0 && reservedPMSize < initialPMSize,
-      s"Reserved size(${reservedPMSize}) should be larger than zero and smaller than initial " +
-        s"size(${initialPMSize})")
-    val totalPMUsableSize = initialPMSize - reservedPMSize
-    val initialDRAMSizeSize = initialPMSize
-    ((totalPMUsableSize * 0.9).toLong,
-      (totalPMUsableSize * 0.9).toLong,
-      (initialDRAMSizeSize * 0.9).toLong,
-      (initialDRAMSizeSize * 0.1).toLong)
-  }
-
-  private val _memorySize = _dataPMCacheSize
-
-  override def memorySize: Long = _memorySize
-
-  override def memoryUsed: Long = _memoryUsed.get()
-
-  override private[filecache] def allocate(size: Long) = {
-    var memBlock: MemoryBlockHolder = null
-    if (!pmFull) {
-      memBlock = persistentMemoryManager.allocate(size)
-      _memoryUsed.addAndGet(memBlock.occupiedSize)
-      memBlockInPM += memBlock
-      if (memBlock.length == 0) {
-        pmFull = true
-        memBlock = dramMemoryManager.allocate(size)
-      }
-    } else {
-      memBlock = dramMemoryManager.allocate(size)
-    }
-  memBlock
-  }
-
-  override private[filecache] def free(block: MemoryBlockHolder): Unit = {
-    if (memBlockInPM.contains(block)) {
-      memBlockInPM.remove(block)
-      persistentMemoryManager.free(block)
-      _memoryUsed.addAndGet(-1 * block.occupiedSize)
-    } else {
-      dramMemoryManager.free(block)
-    }
-  }
-}
