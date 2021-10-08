@@ -20,7 +20,7 @@ package org.apache.spark.sql.execution.datasources.oap.filecache
 import org.apache.hadoop.fs.FSDataInputStream
 import org.apache.parquet.io.SeekableInputStream
 
-import org.apache.spark.sql.execution.datasources.{CacheMetaInfoValue, ExternalDBClient, StoreCacheMetaInfo}
+import org.apache.spark.sql.execution.datasources.{CacheMetaInfoValue, StoreCacheMetaInfo}
 import org.apache.spark.sql.execution.datasources.oap.io.DataFile
 import org.apache.spark.sql.oap.OapRuntime
 import org.apache.spark.unsafe.Platform
@@ -42,14 +42,6 @@ case class BinaryDataFiberId(file: DataFile, columnIndex: Int, rowGroupId: Int) 
   def getFilePath: String = file.path
   def getOffset: Long = this.offset
   def getLength: Long = this.length
-
-  def doReport(host: String, externalDBClient: ExternalDBClient): Unit = {
-    val cacheMetaInfoValue: CacheMetaInfoValue = CacheMetaInfoValue(host,
-      this.getOffset, this.getLength)
-    val storeCacheMetaInfo = StoreCacheMetaInfo(getFilePath, cacheMetaInfoValue)
-    // report cache locality info to redis/etcd
-    externalDBClient.upsert(storeCacheMetaInfo)
-  }
 
   def withLoadCacheParameters(input: SeekableInputStream, offset: Long, length: Int): Unit = {
     this.input = input
@@ -164,15 +156,6 @@ case class VectorDataFiberId(file: DataFile, columnIndex: Int, rowGroupId: Int) 
   def getFilePath: String = this.filePath
   def getOffset: Long = this.offset
   def getLength: Long = this.length
-
-  def doReport(host: String, externalDBClient: ExternalDBClient): Unit = {
-    val cacheMetaInfoValue: CacheMetaInfoValue = CacheMetaInfoValue(
-      host, this.getOffset, this.getLength)
-    val storeCacheMetaInfo = StoreCacheMetaInfo(
-      getFilePath, cacheMetaInfoValue)
-    // report cache locality info to redis/etcd
-    externalDBClient.upsert(storeCacheMetaInfo)
-  }
 
   override def hashCode(): Int = (file.path + columnIndex + rowGroupId).hashCode
 

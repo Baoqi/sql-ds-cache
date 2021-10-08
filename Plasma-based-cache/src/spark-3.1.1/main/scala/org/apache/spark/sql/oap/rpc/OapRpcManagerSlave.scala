@@ -96,21 +96,13 @@ private[spark] class OapRpcManagerSlave(
     // Wait a random interval so the heartbeats don't end up in sync
     val initialDelay = intervalMs + (math.random * intervalMs).asInstanceOf[Int]
 
-    val heartbeatTask = new Runnable() {
-      override def run(): Unit = Utils.logUncaughtExceptions(reportHeartbeat())
-    }
-
     val metricsHeartbeatTask = new Runnable() {
       override def run(): Unit = Utils.logUncaughtExceptions(reportMetricsHeartbeat())
     }
 
-    if (!SparkEnv.get.conf.get(OapConf.OAP_EXTERNAL_CACHE_METADB_ENABLED)) {
-      oapHeartbeater.scheduleAtFixedRate(
-        heartbeatTask, initialDelay, intervalMs, TimeUnit.MILLISECONDS)
-    } else {
-      oapHeartbeater.scheduleAtFixedRate(
-        metricsHeartbeatTask, initialDelay, intervalMs, TimeUnit.MILLISECONDS)
-    }
+    oapHeartbeater.scheduleAtFixedRate(
+      metricsHeartbeatTask, initialDelay, intervalMs, TimeUnit.MILLISECONDS)
+
   }
 
   override private[spark] def stop(): Unit = {

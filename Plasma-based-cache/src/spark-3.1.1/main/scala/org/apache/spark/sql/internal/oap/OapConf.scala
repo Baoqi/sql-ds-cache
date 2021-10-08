@@ -749,27 +749,4 @@ object OapConf {
       .intConf
       .createWithDefault(2)
 
-  val OAP_EXTERNAL_CACHE_METADB_ENABLED = {
-    SqlConfAdapter.buildConf("spark.sql.oap.external.cache.metaDB.enabled")
-      .internal()
-      .doc("Whether to enable external cachemeta db")
-      .booleanConf
-      .createWithDefault(false)
-  }
-
-  val OAP_EXTERNAL_CACHE_METADB_ADDRESS = {
-    SqlConfAdapter.buildConf("spark.sql.oap.external.cache.metaDB.address")
-      .internal()
-      .doc("external cachemeta db address")
-      .stringConf
-      .createWithDefault("127.0.0.1")
-  }
-
-  val OAP_EXTERNAL_CACHE_METADB_IMPL =
-    SqlConfAdapter.buildConf("spark.sql.oap.external.cache.metaDB.impl")
-      .internal()
-      .doc("ExternalDB used to store cache meta info, now support Redis/Etcd")
-      .stringConf
-      .createWithDefault("RedisClient")
-
 }
